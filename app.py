@@ -59,6 +59,9 @@ def tokenize_text(text: str):
     tokens = re.findall(r"\b\w[\w'’-]*\b", text.lower(), flags=re.UNICODE)
     return tokens
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.post("/align")
 async def align(audio: UploadFile = File(...), text: str = Form(...)):
