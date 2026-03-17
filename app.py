@@ -1,5 +1,6 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from vosk import Model, KaldiRecognizer
 import json
 import wave
@@ -8,10 +9,38 @@ import os
 import re
 from rapidfuzz import process, fuzz
 
-# Config: ruta del modelo (descargar en ./models/vosk-model-small-es-0.42)
+# Config: ruta del modelo
 MODEL_PATH = os.environ.get("VOSK_MODEL_PATH", "models/vosk-model-small-es-0.42")
 
 app = FastAPI(title="Vosk Forced-Align (light)")
+
+# CORS — siempre retornar headers incluso en errores
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+@app.options("/{path:path}")
+async def options_handler():
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Cargar modelo al inicio (fallará si no está presente)
 try:
