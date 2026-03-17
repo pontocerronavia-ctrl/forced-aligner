@@ -14,9 +14,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.post("/align")
 async def align(
@@ -46,6 +48,7 @@ async def align(
             sampling_rate=16000,
             return_tensors="pt"
         )
+
         with torch.no_grad():
             logits = model(**inputs).logits
 
@@ -56,29 +59,31 @@ async def align(
 
         config = ctc_segmentation.CtcSegmentationParameters()
         config.char_list = char_list
-        config.index_duration = logits.shape[1] / waveform.shape[0] * 16000
         config.index_duration = waveform.shape[0] / 16000 / logits.shape[1]
 
         ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(
             config, [text]
         )
+
         timings, char_probs, _ = ctc_segmentation.ctc_segmentation(
             config, log_probs[0].numpy(), ground_truth_mat
         )
+
         segments = ctc_segmentation.determine_utterance_segments(
             config, utt_begin_indices, char_probs, timings, [text]
         )
 
         words = text.strip().split()
         result = []
+
         for i, word in enumerate(words):
             if segments and i < len(segments):
-                start, end, score = segments[i][0], segments[i][1], segments[i][2]
+                seg = segments[i]
                 result.append({
                     "word": word,
-                    "start": round(float(start), 3),
-                    "end": round(float(end), 3),
-                    "score": round(float(score), 4)
+                    "start": round(float(seg[0]), 3),
+                    "end": round(float(seg[1]), 3),
+                    "score": round(float(seg[2]), 4)
                 })
             else:
                 result.append({
