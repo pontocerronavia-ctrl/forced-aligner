@@ -75,4 +75,20 @@ async def align(
             if segments and i < len(segments):
                 start, end, score = segments[i][0], segments[i][1], segments[i][2]
                 result.append({
-                    "word": wor
+                    "word": word,
+                    "start": round(float(start), 3),
+                    "end": round(float(end), 3),
+                    "score": round(float(score), 4)
+                })
+            else:
+                result.append({
+                    "word": word,
+                    "start": 0.0,
+                    "end": 0.0,
+                    "score": 0.0
+                })
+
+        return {"words": result}
+
+    finally:
+        os.unlink(tmp_path)
