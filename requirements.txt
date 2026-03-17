@@ -1,7 +1,5 @@
 fastapi
-uvicorn
-torch
-torchaudio
-transformers
-ctc-segmentation
+uvicorn[standard]
+vosk
+rapidfuzz
 python-multipart
