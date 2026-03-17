@@ -1,99 +1,156 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-import torch
-import torchaudio
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import JSONResponse
+from vosk import Model, KaldiRecognizer
+import json
+import wave
 import tempfile
 import os
+import re
+from rapidfuzz import process, fuzz
 
-app = FastAPI()
+# Config: ruta del modelo (descargar en ./models/vosk-model-small-es-0.42)
+MODEL_PATH = os.environ.get("VOSK_MODEL_PATH", "models/vosk-model-small-es-0.42")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Vosk Forced-Align (light)")
+
+# Cargar modelo al inicio (fallará si no está presente)
+try:
+    model = Model(MODEL_PATH)
+except Exception as e:
+    model = None
+    print(f"[WARN] Vosk model not loaded. Put model under {MODEL_PATH}. Error: {e}")
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+def ensure_wav_16k_mono(path: str):
+    """Verifica que el WAV sea 16kHz mono; lanza Exception si no."""
+    with wave.open(path, "rb") as wf:
+        channels = wf.getnchannels()
+        rate = wf.getframerate()
+        sampwidth = wf.getsampwidth()
+    if channels != 1 or rate != 16000:
+        raise ValueError(f"WAV must be mono (1) and 16kHz. Found channels={channels}, rate={rate}, sampwidth={sampwidth}")
+
+
+def transcribe_with_vosk(wav_path: str):
+    """Transcribe WAV (assumes 16k mono) y devuelve lista de words con start,end,conf."""
+    wf = wave.open(wav_path, "rb")
+    rec = KaldiRecognizer(model, wf.getframerate())
+    rec.SetWords(True)
+    results = []
+    while True:
+        data = wf.readframes(4000)
+        if len(data) == 0:
+            break
+        if rec.AcceptWaveform(data):
+            r = json.loads(rec.Result())
+            if "result" in r:
+                results.extend(r["result"])
+    # Final
+    r = json.loads(rec.FinalResult())
+    if "result" in r:
+        results.extend(r["result"])
+    # Each item: { "conf": float, "start": float, "end": float, "word": str }
+    return results
+
+
+def tokenize_text(text: str):
+    """Tokeniza texto en palabras unicode (minimiza signos de puntuación)."""
+    # mantén acentos y caracteres unicode; devuelve lista en minúsculas
+    tokens = re.findall(r"\b\w[\w'’-]*\b", text.lower(), flags=re.UNICODE)
+    return tokens
 
 
 @app.post("/align")
-async def align(
-    audio: UploadFile = File(...),
-    text: str = Form(...)
-):
-    from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-    import ctc_segmentation
+async def align(audio: UploadFile = File(...), text: str = Form(...)):
+    """
+    Recibe: form field 'text' (string) y file 'audio' (WAV 16kHz mono).
+    Retorna: JSON { "aligned": [ {word, start, end, score}, ... ] }
+    """
+    if model is None:
+        raise HTTPException(status_code=503, detail=f"Vosk model not loaded. Place model under {MODEL_PATH}")
 
-    MODEL_ID = "facebook/wav2vec2-base-960h"
-    processor = Wav2Vec2Processor.from_pretrained(MODEL_ID)
-    model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID)
-    model.eval()
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(await audio.read())
+    # Guardar wav temporalmente (asegura que el cliente suba WAV 16k mono)
+    suffix = os.path.splitext(audio.filename)[1] or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
+        tmp.write(await audio.read())
+        tmp.flush()
 
     try:
-        waveform, sr = torchaudio.load(tmp_path)
-        if sr != 16000:
-            waveform = torchaudio.functional.resample(waveform, sr, 16000)
-        waveform = waveform.mean(dim=0)
+        # Validación simple: exigir WAV 16k mono para evitar dependencia ffmpeg
+        try:
+            ensure_wav_16k_mono(tmp_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Audio must be WAV 16kHz mono. Convert locally with ffmpeg: ffmpeg -i input.mp3 -ar 16000 -ac 1 output.wav. Error: {e}"
+            )
 
-        inputs = processor(
-            waveform.numpy(),
-            sampling_rate=16000,
-            return_tensors="pt"
-        )
+        vosk_words = transcribe_with_vosk(tmp_path)  # list of dicts
+        # Normalizar lista de palabras lower
+        vosk_word_list = [w["word"].lower() for w in vosk_words]
 
-        with torch.no_grad():
-            logits = model(**inputs).logits
+        tokens = tokenize_text(text)
+        aligned = []
 
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        # Matching secuencial con ventana (evita empates repetidos)
+        last_idx = 0
+        window = 15  # lookahead window; configurable para mejores mapeos
+        threshold = 60  # umbral de similitud (0-100)
 
-        vocab = processor.tokenizer.get_vocab()
-        char_list = [k for k, v in sorted(vocab.items(), key=lambda x: x[1])]
+        for token in tokens:
+            # slice window from last_idx
+            slice_end = min(last_idx + window, len(vosk_word_list))
+            best = None
+            if last_idx < len(vosk_word_list):
+                sub = vosk_word_list[last_idx:slice_end]
+                if sub:
+                    m = process.extractOne(token, sub, scorer=fuzz.ratio)
+                    if m:
+                        match_str, score, rel_idx = m  # rel_idx es índice en sub
+                        abs_idx = last_idx + rel_idx
+                        if score >= threshold:
+                            vw = vosk_words[abs_idx]
+                            conf = vw.get("conf", score / 100.0)
+                            aligned.append({
+                                "word": token,
+                                "start": float(vw["start"]),
+                                "end": float(vw["end"]),
+                                "score": float(conf)
+                            })
+                            last_idx = abs_idx + 1
+                            continue  # siguiente token
 
-        config = ctc_segmentation.CtcSegmentationParameters()
-        config.char_list = char_list
-        config.index_duration = waveform.shape[0] / 16000 / logits.shape[1]
+            # fallback: buscar globalmente a partir de last_idx
+            if last_idx < len(vosk_word_list):
+                m = process.extractOne(token, vosk_word_list[last_idx:], scorer=fuzz.ratio)
+                if m:
+                    match_str, score, rel_idx = m
+                    abs_idx = last_idx + rel_idx
+                    if score >= (threshold - 10):  # umbral más laxo para fallback
+                        vw = vosk_words[abs_idx]
+                        conf = vw.get("conf", score / 100.0)
+                        aligned.append({
+                            "word": token,
+                            "start": float(vw["start"]),
+                            "end": float(vw["end"]),
+                            "score": float(conf)
+                        })
+                        last_idx = abs_idx + 1
+                        continue
 
-        ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_text(
-            config, [text]
-        )
+            # Si no se encontró correspondencia, devolver null timestamps
+            aligned.append({
+                "word": token,
+                "start": None,
+                "end": None,
+                "score": 0.0
+            })
 
-        timings, char_probs, _ = ctc_segmentation.ctc_segmentation(
-            config, log_probs[0].numpy(), ground_truth_mat
-        )
-
-        segments = ctc_segmentation.determine_utterance_segments(
-            config, utt_begin_indices, char_probs, timings, [text]
-        )
-
-        words = text.strip().split()
-        result = []
-
-        for i, word in enumerate(words):
-            if segments and i < len(segments):
-                seg = segments[i]
-                result.append({
-                    "word": word,
-                    "start": round(float(seg[0]), 3),
-                    "end": round(float(seg[1]), 3),
-                    "score": round(float(seg[2]), 4)
-                })
-            else:
-                result.append({
-                    "word": word,
-                    "start": 0.0,
-                    "end": 0.0,
-                    "score": 0.0
-                })
-
-        return {"words": result}
+        return JSONResponse({"aligned": aligned})
 
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
