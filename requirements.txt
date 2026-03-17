@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+torch
+torchaudio
+transformers
+ctc-segmentation
+python-multipart
