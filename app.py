@@ -18,7 +18,7 @@ app.add_middleware(
 )
 
 # Cargar modelo una vez al arrancar
-MODEL_ID = "facebook/wav2vec2-large-xlsr-53-spanish"
+MODEL_ID = "facebook/wav2vec2-base"
 processor = Wav2Vec2Processor.from_pretrained(MODEL_ID)
 model = Wav2Vec2Model.from_pretrained(MODEL_ID)
 model.eval()
